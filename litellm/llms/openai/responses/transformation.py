@@ -225,6 +225,77 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
 
         return f"{api_base}/responses"
 
+    @staticmethod
+    def _apply_streaming_chunk_defaults(parsed_chunk: dict) -> dict:
+        """
+        Supply sensible defaults for fields that OpenAI-compatible providers
+        may omit from streaming SSE events.
+
+        This prevents Pydantic ValidationError when providers send minimal
+        event payloads that lack required fields like created_at, output,
+        output_index, or content_index.
+        """
+        chunk = dict(parsed_chunk)
+        event_type = chunk.get("type", "")
+
+        # Response-level events: ensure 'response' sub-object has defaults
+        if event_type in (
+            "response.created",
+            "response.in_progress",
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        ):
+            if "response" in chunk and isinstance(chunk["response"], dict):
+                resp = chunk["response"]
+                if "created_at" not in resp:
+                    resp["created_at"] = 0
+                if "output" not in resp:
+                    resp["output"] = []
+
+        # Output item events: ensure output_index is present
+        if event_type in ("response.output_item.added", "response.output_item.done"):
+            if "output_index" not in chunk:
+                chunk["output_index"] = 0
+
+        # Content part events: ensure output_index and content_index
+        if event_type in (
+            "response.content_part.added",
+            "response.content_part.done",
+        ):
+            if "output_index" not in chunk:
+                chunk["output_index"] = 0
+            if "content_index" not in chunk:
+                chunk["content_index"] = 0
+
+        # Text delta/done events: ensure output_index and content_index
+        if event_type in (
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.output_text.annotation.added",
+        ):
+            if "output_index" not in chunk:
+                chunk["output_index"] = 0
+            if "content_index" not in chunk:
+                chunk["content_index"] = 0
+
+        # Refusal events: ensure output_index and content_index
+        if event_type in ("response.refusal.delta", "response.refusal.done"):
+            if "output_index" not in chunk:
+                chunk["output_index"] = 0
+            if "content_index" not in chunk:
+                chunk["content_index"] = 0
+
+        # Function call events: ensure output_index
+        if event_type in (
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+        ):
+            if "output_index" not in chunk:
+                chunk["output_index"] = 0
+
+        return chunk
+
     def transform_streaming_response(
         self,
         model: str,
@@ -258,7 +329,31 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
             # instantiation and let higher-level handlers manage errors.
             verbose_logger.debug("Failed to coalesce error.code in parsed_chunk")
 
-        return event_pydantic_model(**parsed_chunk)
+        try:
+            return event_pydantic_model(**parsed_chunk)
+        except Exception as e:
+            # OpenAI-compatible providers may omit required fields (e.g.
+            # created_at, output, output_index, content_index).  Apply
+            # sensible defaults and retry strict validation first; if that
+            # still fails, fall back to model_construct() which skips
+            # validation entirely — matching the pattern used in
+            # transform_response_api_response() for non-streaming responses.
+            verbose_logger.debug(
+                "Pydantic validation failed for streaming event type=%s: %s, "
+                "applying defaults and retrying",
+                event_type,
+                str(e),
+            )
+            try:
+                patched_chunk = self._apply_streaming_chunk_defaults(parsed_chunk)
+                return event_pydantic_model(**patched_chunk)
+            except Exception:
+                verbose_logger.debug(
+                    "Pydantic validation still failed after defaults for "
+                    "event type=%s, using model_construct",
+                    event_type,
+                )
+                return event_pydantic_model.model_construct(**parsed_chunk)
 
     @staticmethod
     def get_event_model_class(event_type: str) -> Any:
